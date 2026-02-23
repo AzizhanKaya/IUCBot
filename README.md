@@ -11,6 +11,7 @@ Uygulama üzerinden üniversite sistemine tarayıcıya ihtiyaç duymadan termina
 - [x] Ders Notları
   - [ ] Harf Notları
 - [x] Ders Seçimi
+- [ ] Not kartı grafiği
 - [ ] Anket çözme
 - [ ] Notları bildirim gönderme
 - [ ] Ders dosya senkronizasyonu
