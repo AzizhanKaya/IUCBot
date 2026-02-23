@@ -1,7 +1,7 @@
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::client::obs::{Course, ObsClient};
-use crate::router::PageAction;
+use crate::pages::PageAction;
 use crossterm::event::{Event, KeyCode, MouseEventKind};
 use ratatui::Frame;
 use ratatui::backend::Backend;
@@ -10,59 +10,76 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 
 pub struct DersNotlari {
-    courses: Vec<Course>,
+    pub courses: Vec<Course>,
     state: TableState,
     selected_course_idx: usize,
-    client: Rc<ObsClient>,
+    client: Arc<ObsClient>,
     year: i32,
     term: i32,
+    fetch_result: Arc<Mutex<Option<Vec<Course>>>>,
 }
 
 impl DersNotlari {
-    pub fn new(client: Rc<ObsClient>) -> Self {
-        let mut inst = Self {
+    pub fn new(client: Arc<ObsClient>) -> Self {
+        Self {
             state: TableState::default(),
             selected_course_idx: 0,
             courses: Vec::new(),
             year: 2025,
             term: 1,
             client,
-        };
-        inst.fetch_courses();
-        inst
+            fetch_result: Arc::new(Mutex::new(None)),
+        }
     }
 
-    fn fetch_courses(&mut self) {
+    pub fn fetch_courses(&mut self) {
         let y_str = self.year.to_string();
         let t_str = self.term.to_string();
-        if let Ok(courses) = self.client.get_exam_results(&y_str, &t_str) {
-            self.courses = courses;
+        let client = self.client.clone();
+        let result_slot = self.fetch_result.clone();
+
+        tokio::spawn(async move {
+            let res = if let Ok(courses) = client.get_exam_results(&y_str, &t_str).await {
+                courses
+            } else {
+                Vec::new()
+            };
+            *result_slot.lock().unwrap() = Some(res);
+        });
+    }
+
+    pub fn update(&mut self) -> PageAction {
+        let res = self.fetch_result.lock().unwrap().take();
+        if let Some(res) = res {
+            self.courses = res;
             self.selected_course_idx = 0;
             self.update_state(false);
-        } else {
-            self.courses.clear();
-            self.update_state(false);
         }
+        PageAction::None
     }
 
-    fn next_term(&mut self) {
-        if self.term == 2 {
-            self.term = 1;
-            self.year += 1;
+    fn next_term(&mut self) -> PageAction {
+        let (y, t) = if self.term == 2 {
+            (self.year + 1, 1)
         } else {
-            self.term += 1;
-        }
+            (self.year, self.term + 1)
+        };
+        self.year = y;
+        self.term = t;
         self.fetch_courses();
+        PageAction::None
     }
 
-    fn prev_term(&mut self) {
-        if self.term == 1 {
-            self.term = 2;
-            self.year -= 1;
+    fn prev_term(&mut self) -> PageAction {
+        let (y, t) = if self.term == 1 {
+            (self.year - 1, 2)
         } else {
-            self.term -= 1;
-        }
+            (self.year, self.term - 1)
+        };
+        self.year = y;
+        self.term = t;
         self.fetch_courses();
+        PageAction::None
     }
 
     fn update_state(&mut self, align_bottom: bool) {
@@ -207,8 +224,8 @@ impl DersNotlari {
             Event::Key(key) => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.next(),
                 KeyCode::Up | KeyCode::Char('k') => self.previous(),
-                KeyCode::Right | KeyCode::Char('l') => self.next_term(),
-                KeyCode::Left | KeyCode::Char('h') => self.prev_term(),
+                KeyCode::Right | KeyCode::Char('l') => return self.next_term(),
+                KeyCode::Left | KeyCode::Char('h') => return self.prev_term(),
                 _ => {}
             },
             Event::Mouse(mouse) => match mouse.kind {

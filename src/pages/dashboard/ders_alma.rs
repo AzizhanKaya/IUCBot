@@ -1,5 +1,5 @@
 use crate::client::obs::{AlinabilecekDers, ObsClient};
-use crate::router::PageAction;
+use crate::pages::PageAction;
 use crossterm::event::{Event, KeyCode};
 use ratatui::Frame;
 use ratatui::backend::Backend;
@@ -7,7 +7,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Span, Spans};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 pub enum State {
     Loading,
@@ -21,11 +21,12 @@ pub struct DersAlma {
     course_list_state: ListState,
     pub sections: Vec<(String, Vec<AlinabilecekDers>)>,
     state: State,
-    client: Option<Rc<ObsClient>>,
+    client: Option<Arc<ObsClient>>,
     error: Option<String>,
-    needs_fetch: bool,
-    needs_save: bool,
-    action_ready: bool,
+    pub needs_fetch: bool,
+    pub needs_save: bool,
+    fetch_result: Arc<Mutex<Option<Result<Vec<AlinabilecekDers>, String>>>>,
+    save_result: Arc<Mutex<Option<Result<String, String>>>>,
 }
 
 impl Default for DersAlma {
@@ -38,25 +39,25 @@ impl Default for DersAlma {
             error: None,
             needs_fetch: false,
             needs_save: false,
-            action_ready: false,
+            fetch_result: Arc::new(Mutex::new(None)),
+            save_result: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 impl DersAlma {
-    pub fn new(client: Rc<ObsClient>) -> Self {
-        let mut inst = Self {
+    pub fn new(client: Arc<ObsClient>) -> Self {
+        Self {
             course_list_state: ListState::default(),
             client: Some(client),
             sections: Vec::new(),
             state: State::Loading,
             error: None,
-            needs_fetch: false,
+            needs_fetch: true,
             needs_save: false,
-            action_ready: false,
-        };
-        inst.fetch_courses();
-        inst
+            fetch_result: Arc::new(Mutex::new(None)),
+            save_result: Arc::new(Mutex::new(None)),
+        }
     }
 
     fn get_flat_len(&self) -> usize {
@@ -89,10 +90,55 @@ impl DersAlma {
         None
     }
 
-    fn fetch_courses(&mut self) {
+    pub fn fetch_courses(&mut self) {
         if let Some(client) = &self.client {
             self.state = State::Loading;
-            match client.get_alinabilecek_dersler() {
+            let client = client.clone();
+            let result_slot = self.fetch_result.clone();
+
+            tokio::spawn(async move {
+                let res = client.get_alinabilecek_dersler().await;
+                let mapped = match res {
+                    Ok(val) => Ok(val),
+                    Err(e) => {
+                        log::warn!("Dersler fetch edilirken hata: {}", e);
+                        Err(e.to_string())
+                    }
+                };
+                *result_slot.lock().unwrap() = Some(mapped);
+            });
+        }
+    }
+
+    pub fn save_courses(&mut self) {
+        if let Some(client) = &self.client {
+            self.state = State::Loading;
+
+            let mut selected_courses = Vec::new();
+            for (_, section_courses) in &self.sections {
+                selected_courses.extend(section_courses.iter().filter(|c| c.is_selected).cloned());
+            }
+
+            let client = client.clone();
+            let result_slot = self.save_result.clone();
+
+            tokio::spawn(async move {
+                let res = client.kaydet_dersler(&selected_courses).await;
+                let mapped = match res {
+                    Ok(val) => Ok(val),
+                    Err(e) => {
+                        log::error!("Dersler kaydedilirken hata: {}", e);
+                        Err(e.to_string())
+                    }
+                };
+                *result_slot.lock().unwrap() = Some(mapped);
+            });
+        }
+    }
+
+    pub fn update(&mut self) -> PageAction {
+        if let Some(res) = self.fetch_result.lock().unwrap().take() {
+            match res {
                 Ok(mut courses) => {
                     courses.iter_mut().for_each(|c| {
                         if c.Tipi == "Zorunlu" {
@@ -115,7 +161,7 @@ impl DersAlma {
                         }
                     }
 
-                    let mut sections = Vec::new();
+                    let mut sections: Vec<(String, Vec<AlinabilecekDers>)> = Vec::new();
                     let mut basliklar: Vec<String> = secmeliler.keys().cloned().collect();
                     basliklar.sort();
                     for b in basliklar {
@@ -142,43 +188,37 @@ impl DersAlma {
                     self.error = None;
                 }
                 Err(e) => {
-                    let err_msg = e.to_string();
-                    if err_msg.contains("Ders Alma Takvimi Dışındasınız") {
+                    if e.contains("Ders Alma Takvimi Dışındasınız") {
                         self.state = State::OutOfSchedule;
                     } else {
-                        self.error = Some(err_msg.clone());
-                        self.state = State::Error(err_msg);
+                        log::error!("Dersler listelenemedi (update): {}", e);
+                        self.error = Some(e.clone());
+                        self.state = State::Error(e);
                     }
                 }
             }
         }
-    }
 
-    fn save_courses(&mut self) {
-        if let Some(client) = &self.client {
-            self.state = State::Loading;
-
-            let mut selected_courses = Vec::new();
-            for (_, section_courses) in &self.sections {
-                selected_courses.extend(section_courses.iter().filter(|c| c.is_selected).cloned());
-            }
-
-            match client.kaydet_dersler(&selected_courses) {
+        if let Some(res) = self.save_result.lock().unwrap().take() {
+            match res {
                 Ok(_) => {
                     self.state = State::Saved;
                     self.error = None;
                 }
                 Err(e) => {
-                    let err_msg = e.to_string();
-                    if err_msg.contains("Ders Alma Takvimi Dışındasınız") {
+                    if e.contains("Ders Alma Takvimi Dışındasınız") {
+                        log::warn!("Ders Alma Takvimi Dışındasınız (kaydet)");
                         self.state = State::OutOfSchedule;
                     } else {
-                        self.error = Some(err_msg.clone());
-                        self.state = State::Error(err_msg);
+                        log::error!("Ders kaydetme başarısız (update): {}", e);
+                        self.error = Some(e.clone());
+                        self.state = State::Error(e);
                     }
                 }
             }
         }
+
+        PageAction::None
     }
 
     fn next_course(&mut self) {
@@ -228,10 +268,6 @@ impl DersAlma {
     }
 
     pub fn render<B: Backend>(&mut self, frame: &mut Frame<B>, area: Rect) {
-        if self.needs_fetch || self.needs_save {
-            self.action_ready = true;
-        }
-
         let mut items = Vec::new();
         if matches!(self.state, State::Loaded | State::Error(_)) {
             let mut idx = 0;
@@ -291,9 +327,13 @@ impl DersAlma {
                 ],
                 false,
             ),
-            State::Error(_) => ("Ders seçimi (boşluk ile seç, enter ile onayla", items, true),
+            State::Error(_) => (
+                "Ders seçimi (boşluk ile seç, enter ile onayla)",
+                items,
+                true,
+            ),
             State::Loaded => (
-                "Ders seçimi (boşluk ile seç, enter ile onayla",
+                "Ders seçimi (boşluk ile seç, enter ile onayla)",
                 items,
                 false,
             ),
@@ -343,9 +383,8 @@ impl DersAlma {
                 if key.code == KeyCode::Char('r')
                     && matches!(self.state, State::Saved | State::OutOfSchedule)
                 {
-                    self.state = State::Loading;
-                    self.needs_fetch = true;
-                    self.action_ready = false;
+                    self.fetch_courses();
+                    return PageAction::Tick;
                 }
             }
             return PageAction::None;
@@ -363,27 +402,12 @@ impl DersAlma {
                     self.toggle_course();
                 }
                 KeyCode::Enter => {
-                    self.state = State::Loading;
-                    self.needs_save = true;
-                    self.action_ready = false;
+                    self.save_courses();
+                    return PageAction::Tick;
                 }
                 _ => {}
             }
         }
         PageAction::None
-    }
-
-    pub fn tick(&mut self) {
-        if self.action_ready {
-            if self.needs_fetch {
-                self.needs_fetch = false;
-                self.action_ready = false;
-                self.fetch_courses();
-            } else if self.needs_save {
-                self.needs_save = false;
-                self.action_ready = false;
-                self.save_courses();
-            }
-        }
     }
 }

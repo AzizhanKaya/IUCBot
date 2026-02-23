@@ -7,10 +7,11 @@ use ratatui::{
     style::{Color, Style},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use std::sync::{Arc, Mutex};
 
 use crate::client::aksis::AksisClient;
-use crate::pages::{Contains, Page, STORE};
-use crate::router::{PageAction, Route};
+use crate::pages::{Contains, Page, PageAction, STORE};
+use crate::router::Route;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
@@ -62,9 +63,8 @@ pub struct Login {
     layout: Layout,
     error: Option<String>,
     is_loading: bool,
-    needs_login: bool,
-    needs_verify: bool,
-    action_ready: bool,
+    login_result: Arc<Mutex<Option<Result<(Option<String>, String), String>>>>,
+    verify_result: Arc<Mutex<Option<Result<String, String>>>>,
 }
 
 impl Login {
@@ -80,9 +80,8 @@ impl Login {
             layout: Layout::new(Rect::default(), &Stage::Creds),
             error: None,
             is_loading: false,
-            needs_login: false,
-            needs_verify: false,
-            action_ready: false,
+            login_result: Arc::new(Mutex::new(None)),
+            verify_result: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -165,10 +164,6 @@ impl Layout {
 
 impl<B: Backend> Page<B> for Login {
     fn render(&mut self, frame: &mut Frame<B>) {
-        if self.needs_login || self.needs_verify {
-            self.action_ready = true;
-        }
-
         let size = frame.size();
 
         if self.layout.size != size {
@@ -198,7 +193,7 @@ impl<B: Backend> Page<B> for Login {
                 KeyCode::Char(c) => {
                     if key.modifiers.contains(KeyModifiers::CONTROL) {
                         if c == 'c' || c == 'd' {
-                            return PageAction::Exit;
+                            return PageAction::Quit;
                         }
                     } else {
                         match self.focus {
@@ -230,23 +225,51 @@ impl<B: Backend> Page<B> for Login {
                         && !self.password.is_empty()
                     {
                         self.is_loading = true;
-                        self.needs_login = true;
-                        self.action_ready = false;
                         self.error = None;
-                        return PageAction::None;
+
+                        let mut client = self.client.clone();
+                        let username = self.username.clone();
+                        let password = self.password.clone();
+                        let result_slot = self.login_result.clone();
+
+                        tokio::spawn(async move {
+                            let res = client.login(&username, &password).await;
+                            let mapped = match res {
+                                Ok(val) => Ok(val),
+                                Err(e) => {
+                                    log::error!("Login attempt failed in login page: {}", e);
+                                    Err(e.to_string())
+                                }
+                            };
+                            *result_slot.lock().unwrap() = Some(mapped);
+                        });
                     }
 
                     if self.focus == Focus::Verify && !self.sms_code.is_empty() {
                         self.is_loading = true;
-                        self.needs_verify = true;
-                        self.action_ready = false;
                         self.error = None;
-                        return PageAction::None;
+
+                        let mut client = self.client.clone();
+                        let sms_code = self.sms_code.clone();
+                        let csrf_token = self.csrf_token.clone();
+                        let result_slot = self.verify_result.clone();
+
+                        tokio::spawn(async move {
+                            let res = client.send_sms(&sms_code, &csrf_token).await;
+                            let mapped = match res {
+                                Ok(val) => Ok(val),
+                                Err(e) => {
+                                    log::error!("SMS verification request failed: {}", e);
+                                    Err(e.to_string())
+                                }
+                            };
+                            *result_slot.lock().unwrap() = Some(mapped);
+                        });
                     }
                 }
 
                 KeyCode::Esc => {
-                    return PageAction::Exit;
+                    return PageAction::Quit;
                 }
                 _ => {}
             },
@@ -278,46 +301,43 @@ impl<B: Backend> Page<B> for Login {
         PageAction::None
     }
 
-    fn tick(&mut self) -> PageAction {
-        if self.action_ready {
-            if self.needs_login {
-                self.needs_login = false;
-                self.action_ready = false;
-
-                let auth_cookie = match self.client.login(&self.username, &self.password) {
-                    Ok((Some(cookie), _)) => cookie,
-                    Ok((None, csrf_token)) => {
-                        self.csrf_token = csrf_token;
-                        self.stage = Stage::Sms;
-                        self.focus = Focus::SmsCode;
-                        self.is_loading = false;
-                        return PageAction::None;
-                    }
-                    Err(e) => {
-                        self.error = Some(e.to_string());
-                        self.is_loading = false;
-                        return PageAction::None;
-                    }
-                };
-
-                STORE.insert("auth_cookie".to_string(), auth_cookie);
-                self.is_loading = false;
-                return PageAction::Navigate(Route::Dashboard);
-            } else if self.needs_verify {
-                self.needs_verify = false;
-                self.action_ready = false;
-
-                let Ok(auth_cookie) = self.client.send_sms(&self.sms_code, &self.csrf_token) else {
-                    self.error = Some("SMS code error".to_string());
+    fn update(&mut self) -> PageAction {
+        if let Some(res) = self.login_result.lock().unwrap().take() {
+            match res {
+                Ok((Some(cookie), _)) => {
+                    STORE.insert("auth_cookie".to_string(), cookie);
                     self.is_loading = false;
-                    return PageAction::None;
-                };
-
-                STORE.insert("auth_cookie".to_string(), auth_cookie);
-                self.is_loading = false;
-                return PageAction::Navigate(Route::Dashboard);
+                    return PageAction::Navigate(Route::Dashboard);
+                }
+                Ok((None, csrf_token)) => {
+                    self.csrf_token = csrf_token;
+                    self.stage = Stage::Sms;
+                    self.focus = Focus::SmsCode;
+                    self.is_loading = false;
+                }
+                Err(e) => {
+                    log::error!("Login error result handled in update: {}", e);
+                    self.error = Some(e);
+                    self.is_loading = false;
+                }
             }
         }
+
+        if let Some(res) = self.verify_result.lock().unwrap().take() {
+            match res {
+                Ok(cookie) => {
+                    STORE.insert("auth_cookie".to_string(), cookie);
+                    self.is_loading = false;
+                    return PageAction::Navigate(Route::Dashboard);
+                }
+                Err(e) => {
+                    log::error!("Verify error result handled in update: {}", e);
+                    self.error = Some(e);
+                    self.is_loading = false;
+                }
+            }
+        }
+
         PageAction::None
     }
 }

@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
-use reqwest::{Url, blocking::Client, cookie::Jar};
+use reqwest::{Client, Url, cookie::Jar};
 use serde::Deserialize;
-use std::{
-    io::{self, Write},
-    sync::Arc,
-};
+use std::sync::Arc;
+use tokio::task::JoinSet;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct Exam {
     #[serde(rename = "SinavTuru")]
     pub name: String,
@@ -16,9 +14,11 @@ pub struct Exam {
     pub weight: String,
     #[serde(rename = "SinavYayinlanmaTarihiString")]
     pub date: String,
+    #[serde(rename = "SinavID")]
+    pub exam_id: u64,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct Course {
     #[serde(rename = "Key")]
     pub name: String,
@@ -112,7 +112,7 @@ pub struct ObsClient {
 }
 
 impl ObsClient {
-    pub fn new(auth_cookie: String) -> Self {
+    pub async fn new(auth_cookie: String) -> Self {
         let jar = Arc::new(Jar::default());
         let url = Url::parse("https://obs.iuc.edu.tr/").unwrap();
 
@@ -125,30 +125,30 @@ impl ObsClient {
             .build()
             .unwrap();
 
-        client.get("https://obs.iuc.edu.tr/").send().unwrap();
+        client.get("https://obs.iuc.edu.tr/").send().await.unwrap();
 
         ObsClient { client }
     }
 
-    pub fn get_exam_results(&self, year: &str, term: &str) -> Result<Vec<Course>> {
+    pub async fn get_exam_results(&self, year: &str, term: &str) -> Result<Vec<Course>> {
         let url =
             "https://obs.iuc.edu.tr/OgrenimBilgileri/SinavSonuclariVeNotlar/GetOgrenciSinavSonuc";
         let payload = [("group", "DersAdi-asc"), ("yil", year), ("donem", term)];
 
-        let res = self.client.post(url).form(&payload).send()?;
-        let result_text = res.text()?;
+        let res = self.client.post(url).form(&payload).send().await?;
+        let result_text = res.text().await?;
 
         let results: ExamResults = serde_json::from_str(&result_text)?;
         Ok(results.data)
     }
 
-    pub fn get_alinabilecek_dersler(&self) -> Result<Vec<AlinabilecekDers>> {
+    pub async fn get_alinabilecek_dersler(&self) -> Result<Vec<AlinabilecekDers>> {
         let url = "https://obs.iuc.edu.tr/DersAlma/DersAlma/GetAlinabilecekDersler";
         let payload = [("sort", ""), ("group", ""), ("filter", "")];
 
-        let res = self.client.post(url).form(&payload).send()?;
+        let res = self.client.post(url).form(&payload).send().await?;
 
-        let result_text = res.text()?;
+        let result_text = res.text().await?;
 
         if result_text.contains("HataTakvim") {
             anyhow::bail!("Ders Alma Takvimi Dışındasınız");
@@ -161,7 +161,7 @@ impl ObsClient {
         Ok(results.data)
     }
 
-    pub fn kaydet_dersler(&self, dersler: &[AlinabilecekDers]) -> Result<String> {
+    pub async fn kaydet_dersler(&self, dersler: &[AlinabilecekDers]) -> Result<String> {
         let url = "https://obs.iuc.edu.tr/DersAlma/DersAlma/Kaydet";
 
         let mut form_data = Vec::new();
@@ -218,54 +218,88 @@ impl ObsClient {
             ));
         }
 
-        let res = self.client.post(url).form(&form_data).send()?;
-        let result_text = res.text()?;
+        let shared_form = Arc::new(form_data);
 
-        let response: KaydetResponse = serde_json::from_str(&result_text)?;
-        if response.MessageType == "success" {
-            Ok(response.MessageText)
-        } else {
-            anyhow::bail!(response.MessageText)
+        let mut set = JoinSet::new();
+
+        for _ in 0..10 {
+            let client = self.client.clone();
+            let data = Arc::clone(&shared_form);
+            let url_str = url.to_string();
+
+            set.spawn(async move {
+                let res = client.post(&url_str).form(&*data).send().await?;
+
+                let result_text = res.text().await?;
+                let response: KaydetResponse = serde_json::from_str(&result_text)?;
+
+                if response.MessageType == "success" {
+                    Ok(response.MessageText)
+                } else {
+                    anyhow::bail!(response.MessageText)
+                }
+            });
         }
-    }
 
-    pub fn get_ozluk_bilgileri(&self) -> Result<OzlukBilgileriData> {
-        let url = "https://obs.iuc.edu.tr/Profil/Ozluk";
-        let res = self.client.get(url).send()?;
-        let html = res.text()?;
-
-        let document = scraper::Html::parse_document(&html);
-        let fg_sel = scraper::Selector::parse(".form-group").unwrap();
-        let label_sel = scraper::Selector::parse("label").unwrap();
-        let span_sel = scraper::Selector::parse("span.info-input").unwrap();
-
-        let mut ad = String::new();
-        let mut soyad = String::new();
-        let mut tc_kimlik = String::new();
-
-        for fg in document.select(&fg_sel) {
-            if let Some(label) = fg.select(&label_sel).next() {
-                let label_text = label.text().collect::<String>().trim().to_string();
-                if let Some(span) = fg.select(&span_sel).next() {
-                    let span_text = span.text().collect::<String>().trim().to_string();
-                    if label_text == "Adı:" {
-                        ad = span_text;
-                    } else if label_text == "Soyadı:" {
-                        soyad = span_text;
-                    } else if label_text == "Kimlik Numarası:" {
-                        tc_kimlik = span_text;
-                    }
+        // 3. İlk dönen (başarılı veya başarısız) sonucu yakala
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok(Ok(success_msg)) => {
+                    return Ok(success_msg);
+                }
+                Ok(Err(e)) => {
+                    log::error!("Bir deneme başarısız: {}", e);
+                }
+                Err(e) => {
+                    log::error!("Bir deneme çöktü: {}", e);
                 }
             }
         }
 
-        let img_sel = scraper::Selector::parse("img[src^='data:image']").unwrap();
-        let mut resim_base64 = "".to_string();
-        if let Some(img) = document.select(&img_sel).next() {
-            if let Some(src) = img.value().attr("src") {
-                resim_base64 = src.to_string();
+        anyhow::bail!("Başarılı bir sonuç alınamadı.");
+    }
+
+    pub async fn get_ozluk_bilgileri(&self) -> Result<OzlukBilgileriData> {
+        let url = "https://obs.iuc.edu.tr/Profil/Ozluk";
+        let res = self.client.get(url).send().await?;
+        let html = res.text().await?;
+
+        let (ad, soyad, tc_kimlik, resim_base64) = {
+            let document = scraper::Html::parse_document(&html);
+            let fg_sel = scraper::Selector::parse(".form-group").unwrap();
+            let label_sel = scraper::Selector::parse("label").unwrap();
+            let span_sel = scraper::Selector::parse("span.info-input").unwrap();
+
+            let mut ad = String::new();
+            let mut soyad = String::new();
+            let mut tc_kimlik = String::new();
+
+            for fg in document.select(&fg_sel) {
+                if let Some(label) = fg.select(&label_sel).next() {
+                    let label_text = label.text().collect::<String>().trim().to_string();
+                    if let Some(span) = fg.select(&span_sel).next() {
+                        let span_text = span.text().collect::<String>().trim().to_string();
+                        if label_text == "Adı:" {
+                            ad = span_text;
+                        } else if label_text == "Soyadı:" {
+                            soyad = span_text;
+                        } else if label_text == "Kimlik Numarası:" {
+                            tc_kimlik = span_text;
+                        }
+                    }
+                }
             }
-        }
+
+            let img_sel = scraper::Selector::parse("img[src^='data:image']").unwrap();
+            let mut resim_base64 = "".to_string();
+            if let Some(img) = document.select(&img_sel).next() {
+                if let Some(src) = img.value().attr("src") {
+                    resim_base64 = src.to_string();
+                }
+            }
+
+            (ad, soyad, tc_kimlik, resim_base64)
+        };
 
         let kisi_id = html
             .split("kisiId: '")
@@ -285,8 +319,8 @@ impl ObsClient {
                 ("kisiId", kisi_id),
             ];
 
-            if let Ok(res) = self.client.post(iletisim_url).form(&payload).send() {
-                if let Ok(text) = res.text() {
+            if let Ok(res) = self.client.post(iletisim_url).form(&payload).send().await {
+                if let Ok(text) = res.text().await {
                     if let Ok(data) = serde_json::from_str::<IletisimBilgileriResponse>(&text) {
                         iletisim = data.Data;
                     }
@@ -294,8 +328,8 @@ impl ObsClient {
             }
 
             let adres_url = "https://obs.iuc.edu.tr/Profil/Ozluk/GetAdresBilgileri";
-            if let Ok(res) = self.client.post(adres_url).form(&payload).send() {
-                if let Ok(text) = res.text() {
+            if let Ok(res) = self.client.post(adres_url).form(&payload).send().await {
+                if let Ok(text) = res.text().await {
                     if let Ok(data) = serde_json::from_str::<AdresBilgileriResponse>(&text) {
                         adresler = data.Data;
                     }

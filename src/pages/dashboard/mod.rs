@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crossterm::event::{Event, KeyCode};
 use ratatui::Frame;
@@ -8,10 +8,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Span, Spans};
 use ratatui::widgets::{Block, Borders, List, ListItem};
 
-use crate::client;
 use crate::client::obs::ObsClient;
-use crate::pages::Page;
-use crate::router::PageAction;
+use crate::pages::{Page, PageAction};
 
 pub mod ders_alma;
 pub mod ders_notlari;
@@ -48,22 +46,22 @@ impl Tab {
 }
 
 pub struct Dashboard {
-    client: Rc<ObsClient>,
     tab: Tab,
     ozluk_bilgileri: OzlukBilgileri,
     ders_alma: DersAlma,
     ders_notlari: DersNotlari,
+    initialized: bool,
 }
 
 impl Dashboard {
     pub fn new(client: ObsClient) -> Self {
-        let client = Rc::new(client);
+        let client = Arc::new(client);
         Self {
-            client: client.clone(),
             tab: Tab::default(),
             ozluk_bilgileri: OzlukBilgileri::new(client.clone()),
             ders_alma: DersAlma::new(client.clone()),
             ders_notlari: DersNotlari::new(client.clone()),
+            initialized: false,
         }
     }
 }
@@ -119,7 +117,7 @@ impl<B: Backend> Page<B> for Dashboard {
                     return PageAction::None;
                 }
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    return PageAction::Exit;
+                    return PageAction::Quit;
                 }
                 _ => {}
             }
@@ -132,10 +130,18 @@ impl<B: Backend> Page<B> for Dashboard {
         }
     }
 
-    fn tick(&mut self) -> PageAction {
-        if self.tab == Tab::DersAlma {
-            self.ders_alma.tick();
+    fn update(&mut self) -> PageAction {
+        if !self.initialized {
+            self.initialized = true;
+            self.ozluk_bilgileri.fetch_data();
+            self.ders_alma.fetch_courses();
+            self.ders_notlari.fetch_courses();
         }
+
+        self.ozluk_bilgileri.update();
+        self.ders_alma.update();
+        self.ders_notlari.update();
+
         PageAction::None
     }
 }

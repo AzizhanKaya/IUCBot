@@ -1,42 +1,44 @@
 use anyhow::Result;
-use crossterm::event;
-use crossterm::event::DisableMouseCapture;
+use crossterm::event::{self, DisableMouseCapture, Event};
 use crossterm::execute;
-use crossterm::terminal::EnterAlternateScreen;
-use crossterm::terminal::LeaveAlternateScreen;
-use crossterm::terminal::disable_raw_mode;
-use crossterm::terminal::enable_raw_mode;
-use ratatui::backend::Backend;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Alignment;
-use ratatui::style::Color;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
-use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, time::Duration};
 
-mod client;
-mod pages;
-mod router;
+pub mod client;
+pub mod pages;
+pub mod router;
 
+use pages::PageAction;
 use router::{Route, Router};
-
-use crate::pages::Page;
-use crate::router::RouterResult;
 
 struct App<B: Backend> {
     router: Router<B>,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
+    simplelog::WriteLogger::init(
+        log::LevelFilter::Info,
+        simplelog::Config::default(),
+        std::fs::File::create("iucbot.log")?,
+    )?;
+    log::info!("Starting IUCBot...");
+
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen)?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let router = Router::new(Route::Login);
-
-    let mut app: App<_> = App { router };
+    let router: Router<CrosstermBackend<std::io::Stdout>> = Router::new(Route::Login).await;
+    let mut app = App { router };
 
     loop {
         terminal.draw(|f| {
@@ -56,32 +58,39 @@ fn main() -> Result<()> {
             app.router.current_page.render(f);
         })?;
 
-        if event::poll(Duration::from_millis(200))? {
+        let mut page_action = PageAction::None;
+
+        if event::poll(Duration::from_millis(16))? {
             let e = event::read()?;
-
-            if let event::Event::Key(key) = e {
-                if key.kind != event::KeyEventKind::Press {
-                    continue;
+            if let Event::Key(key) = e {
+                if key.kind == event::KeyEventKind::Press {
+                    page_action = app.router.current_page.handle_event(Event::Key(key));
                 }
-            }
-
-            let action = app.router.current_page.handle_event(e);
-
-            match app.router.handle_action(action) {
-                RouterResult::Exit => break,
-                _ => {}
+            } else if let Event::Mouse(mouse) = e {
+                page_action = app.router.current_page.handle_event(Event::Mouse(mouse));
+            } else if let Event::Resize(x, y) = e {
+                page_action = app.router.current_page.handle_event(Event::Resize(x, y));
             }
         }
 
-        let tick_action = app.router.current_page.tick();
-        match app.router.handle_action(tick_action) {
-            RouterResult::Exit => break,
-            _ => {}
+        if matches!(page_action, PageAction::None) {
+            page_action = app.router.current_page.update();
+        }
+
+        if let PageAction::Quit = page_action {
+            break;
+        } else if !matches!(page_action, PageAction::None) {
+            app.router.handle_action(page_action).await;
         }
     }
-    drop(terminal);
 
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
     Ok(())
 }

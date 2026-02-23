@@ -4,10 +4,10 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Span, Spans};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::client::obs::{ObsClient, OzlukBilgileriData};
-use crate::router::PageAction;
+use crate::pages::PageAction;
 use crossterm::event::{Event, KeyCode};
 
 pub enum State {
@@ -17,8 +17,9 @@ pub enum State {
 }
 
 pub struct OzlukBilgileri {
-    client: Option<Rc<ObsClient>>,
+    client: Option<Arc<ObsClient>>,
     state: State,
+    fetch_result: Arc<Mutex<Option<Result<OzlukBilgileriData, String>>>>,
 }
 
 impl Default for OzlukBilgileri {
@@ -26,31 +27,49 @@ impl Default for OzlukBilgileri {
         Self {
             client: None,
             state: State::Loading,
+            fetch_result: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 impl OzlukBilgileri {
-    pub fn new(client: Rc<ObsClient>) -> Self {
-        let mut inst = Self {
+    pub fn new(client: Arc<ObsClient>) -> Self {
+        Self {
             client: Some(client),
             state: State::Loading,
-        };
-        inst.fetch_data();
-        inst
+            fetch_result: Arc::new(Mutex::new(None)),
+        }
     }
 
-    fn fetch_data(&mut self) {
+    pub fn fetch_data(&mut self) {
         if let Some(client) = &self.client {
-            match client.get_ozluk_bilgileri() {
-                Ok(data) => {
-                    self.state = State::Loaded(data);
-                }
+            self.state = State::Loading;
+            let client = client.clone();
+            let result_slot = self.fetch_result.clone();
+            tokio::spawn(async move {
+                let mapped = match client.get_ozluk_bilgileri().await {
+                    Ok(data) => Ok(data),
+                    Err(e) => {
+                        log::error!("Özlük bilgileri fetch hatası: {}", e);
+                        Err(e.to_string())
+                    }
+                };
+                *result_slot.lock().unwrap() = Some(mapped);
+            });
+        }
+    }
+
+    pub fn update(&mut self) -> PageAction {
+        if let Some(res) = self.fetch_result.lock().unwrap().take() {
+            match res {
+                Ok(data) => self.state = State::Loaded(data),
                 Err(e) => {
-                    self.state = State::Error(e.to_string());
+                    log::error!("Özlük bilgileri update hatası: {}", e);
+                    self.state = State::Error(e);
                 }
             }
         }
+        PageAction::None
     }
 
     pub fn render<B: Backend>(&self, frame: &mut Frame<B>, area: Rect) {
@@ -203,7 +222,6 @@ impl OzlukBilgileri {
         if let Event::Key(key) = event {
             if key.code == KeyCode::Char('r') {
                 if matches!(self.state, State::Loaded(_) | State::Error(_)) {
-                    self.state = State::Loading;
                     self.fetch_data();
                 }
             }

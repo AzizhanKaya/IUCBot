@@ -1,8 +1,7 @@
 use anyhow::anyhow;
 use anyhow::{Result, bail};
 use reqwest::{
-    Url,
-    blocking::Client,
+    Client, Url,
     cookie::{CookieStore, Jar},
     header::{self, HeaderMap, HeaderValue},
 };
@@ -38,6 +37,7 @@ impl Cache {
     }
 }
 
+#[derive(Clone)]
 pub struct AksisClient {
     client: Client,
     pub cache: Cache,
@@ -73,13 +73,17 @@ impl AksisClient {
         Ok(token)
     }
 
-    pub fn login(&mut self, username: &str, password: &str) -> Result<(Option<String>, String)> {
-        self.client.get("https://aksis.iuc.edu.tr/").send()?;
+    pub async fn login(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<(Option<String>, String)> {
+        self.client.get("https://aksis.iuc.edu.tr/").send().await?;
 
         let login_url = "https://aksis.iuc.edu.tr/Account/LogOn?returnUrl=%2F";
         let url = Url::parse(login_url)?;
-        let res = self.client.get(login_url).send()?;
-        let html = res.text()?;
+        let res = self.client.get(login_url).send().await?;
+        let html = res.text().await?;
         let csrf_token = self.get_csrf(&html)?;
 
         let payload = [
@@ -107,9 +111,10 @@ impl AksisClient {
             .post(login_url)
             .headers(headers)
             .form(&payload)
-            .send()?;
+            .send()
+            .await?;
 
-        let text = response.text()?;
+        let text = response.text().await?;
         let csrf_token = self.get_csrf(&text)?;
 
         if text.contains("Kullanıcı Adı veya Şifre Hatalı") {
@@ -133,7 +138,7 @@ impl AksisClient {
         Ok((auth_cookie, csrf_token))
     }
 
-    pub fn send_sms(&mut self, sms_code: &str, csrf_token: &str) -> Result<String> {
+    pub async fn send_sms(&mut self, sms_code: &str, csrf_token: &str) -> Result<String> {
         let sms_url = "https://aksis.iuc.edu.tr/Account/LoginSmsmDogrula";
         let url = Url::parse(sms_url)?;
         let payload = [
@@ -148,7 +153,7 @@ impl AksisClient {
             HeaderValue::from_static("https://aksis.iuc.edu.tr/Account/LogOn?ReturnUrl=%2f"),
         );
 
-        self.client.post(sms_url).form(&payload).send()?;
+        self.client.post(sms_url).form(&payload).send().await?;
 
         let cookies_val = self.jar.cookies(&url);
 

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::router::Route;
 use crossterm::event::Event;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -6,15 +6,22 @@ use ratatui::Frame;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 
-use crate::router::PageAction;
-
 pub mod dashboard;
 pub mod login;
+
+#[derive(Debug, Clone)]
+pub enum PageAction {
+    None,
+    Navigate(Route),
+    Back,
+    Quit,
+    Tick,
+}
 
 pub trait Page<B: Backend> {
     fn render(&mut self, terminal: &mut Frame<B>);
     fn handle_event(&mut self, event: Event) -> PageAction;
-    fn tick(&mut self) -> PageAction {
+    fn update(&mut self) -> PageAction {
         PageAction::None
     }
 }
